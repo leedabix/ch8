@@ -2,10 +2,12 @@
 import hashlib
 import time
 import xml.etree.ElementTree as ET
+from io import StringIO
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import plotly.graph_objects as go
 import pydeck as pdk
 import requests
 import streamlit as st
@@ -15,15 +17,15 @@ import streamlit as st
 # 1. 기본 설정
 # ----------------------------------------
 st.set_page_config(
-    page_title="서울 실시간 인구 혼잡도",
+    page_title="서울 실시간 인구 분석",
     page_icon="🗺️",
     layout="wide",
 )
 
-st.title("🗺️ 서울 실시간 인구 혼잡도 지도")
+st.title("🗺️ 서울 실시간 인구 분석")
 st.write(
-    "서울시 실시간 도시데이터 API를 이용해 "
-    "주요 121개 장소의 인구와 혼잡도를 확인합니다."
+    "서울 주요 121개 장소의 실시간 혼잡도와 "
+    "연령대별 인구 비율을 살펴봅니다."
 )
 
 CSV_URL = (
@@ -33,15 +35,32 @@ CSV_URL = (
 
 API_BASE = "http://openapi.seoul.go.kr:8088"
 KST = ZoneInfo("Asia/Seoul")
-
-# 장소별 요청 사이의 대기 시간
+CACHE_SECONDS = 300
 REQUEST_INTERVAL = 0.2
 
-# API 응답을 기억할 시간: 5분
-CACHE_SECONDS = 300
+AGE_FIELDS = {
+    "0~10세": "PPLTN_RATE_0",
+    "10대": "PPLTN_RATE_10",
+    "20대": "PPLTN_RATE_20",
+    "30대": "PPLTN_RATE_30",
+    "40대": "PPLTN_RATE_40",
+    "50대": "PPLTN_RATE_50",
+    "60대": "PPLTN_RATE_60",
+    "70대 이상": "PPLTN_RATE_70",
+}
 
-# 혼잡도별 지도 색상
-COLORS = {
+AGE_COLORS = [
+    "#93C5FD",
+    "#60A5FA",
+    "#2563EB",
+    "#14B8A6",
+    "#84CC16",
+    "#FACC15",
+    "#FB923C",
+    "#EF4444",
+]
+
+CONGESTION_COLORS = {
     "여유": [34, 197, 94, 210],
     "보통": [234, 179, 8, 210],
     "약간 붐빔": [249, 115, 22, 210],
@@ -61,86 +80,86 @@ except Exception:
 
 if not api_key or not str(api_key).strip():
     st.error("서울시 Open API 인증키가 등록되지 않았습니다.")
-
     st.info(
-        "스트림릿 클라우드에서 앱의 "
-        "Settings → Secrets를 열고 "
-        "다음과 같이 인증키를 등록하세요.\n\n"
-        'SEOUL_KEY = "발급받은_인증키"\n\n'
-        "설정을 저장한 뒤 앱을 다시 실행하면 됩니다."
+        "스트림릿 클라우드의 Settings → Secrets를 열고 "
+        'SEOUL_KEY = "발급받은_인증키" 형식으로 '
+        "등록한 뒤 앱을 다시 실행하세요."
     )
     st.stop()
 
 api_key = str(api_key).strip()
 
-# 캐시 구분에만 사용할 키의 해시값
-# 실제 인증키를 화면이나 로그에 표시하지 않음
+# 인증키 자체는 캐시 키나 출력값으로 사용하지 않음
 key_fingerprint = hashlib.sha256(
     api_key.encode("utf-8")
 ).hexdigest()
 
 
 # ----------------------------------------
-# 3. 장소 목록 CSV 불러오기
+# 3. 장소 목록 불러오기
 # ----------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_areas():
     response = requests.get(CSV_URL, timeout=15)
     response.raise_for_status()
 
-    # UTF-8 BOM이 있어도 열 이름을 정상적으로 읽음
-    from io import StringIO
+    text = response.content.decode("utf-8-sig")
 
     df = pd.read_csv(
-        StringIO(response.content.decode("utf-8-sig")),
+        StringIO(text),
         dtype={"코드": "string"},
     )
 
     required = ["코드", "지역명", "분류", "위도", "경도"]
 
-    missing = [col for col in required if col not in df.columns]
-
-    if missing:
-        raise ValueError("CSV에 필요한 열이 없습니다.")
+    if any(col not in df.columns for col in required):
+        raise ValueError("필수 열이 누락되었습니다.")
 
     df = df[required].copy()
-    df["코드"] = df["코드"].astype("string").str.strip()
-    df["지역명"] = df["지역명"].astype("string").str.strip()
-    df["분류"] = df["분류"].astype("string").str.strip()
 
-    df["위도"] = pd.to_numeric(df["위도"], errors="coerce")
-    df["경도"] = pd.to_numeric(df["경도"], errors="coerce")
+    for col in ["코드", "지역명", "분류"]:
+        df[col] = df[col].astype("string").str.strip()
+
+    for col in ["위도", "경도"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df = df.dropna(subset=required)
+
     df = df.loc[
         df["위도"].between(33, 39)
         & df["경도"].between(124, 132)
+        & df["코드"].ne("")
     ]
 
-    df = df.drop_duplicates(subset=["코드"])
-    return df.reset_index(drop=True)
+    return df.drop_duplicates("코드").reset_index(drop=True)
 
 
 try:
     areas = load_areas()
-except (requests.exceptions.RequestException, ValueError):
+except requests.exceptions.Timeout:
+    st.error("장소 목록 서버가 15초 안에 응답하지 않았습니다.")
+    st.stop()
+except requests.exceptions.RequestException:
     st.error(
-        "장소 목록 CSV를 불러오지 못했습니다. "
-        "인터넷 연결이나 CSV 주소 및 열 이름을 확인하세요."
+        "장소 목록을 불러오지 못했습니다. "
+        "인터넷 연결과 GitHub CSV 주소를 확인하세요."
     )
     st.stop()
-except Exception:
-    st.error("장소 목록을 처리하는 중 문제가 발생했습니다.")
+except (ValueError, UnicodeError, pd.errors.ParserError):
+    st.error(
+        "CSV 파일을 읽지 못했습니다. "
+        "파일 형식과 열 이름을 확인하세요."
+    )
     st.stop()
 
 if areas.empty:
-    st.warning("CSV에서 조회할 장소를 찾지 못했습니다.")
+    st.error("조회할 장소가 없습니다.")
     st.stop()
 
 if len(areas) != 121:
     st.warning(
-        f"장소 목록에서 {len(areas)}곳을 확인했습니다. "
-        "예상한 121곳과 다르므로 CSV 내용을 확인하세요."
+        f"장소 목록에 {len(areas)}곳이 있습니다. "
+        "예상한 121곳과 다릅니다."
     )
 
 
@@ -151,13 +170,16 @@ def to_number(value):
     if value is None:
         return None
 
-    value = str(value).replace(",", "").strip()
+    text = str(value).replace(",", "").strip()
 
-    if not value:
+    if not text:
         return None
 
     try:
-        return float(value)
+        number = float(text)
+        if not 0 <= number < float("inf"):
+            return None
+        return number
     except ValueError:
         return None
 
@@ -177,17 +199,17 @@ def format_rate(value):
 # ----------------------------------------
 # 5. XML 응답에서 인구 정보 추출
 # ----------------------------------------
-def parse_population_xml(xml_text):
+def parse_population_xml(content):
     try:
-        root = ET.fromstring(xml_text)
+        root = ET.fromstring(content)
     except ET.ParseError:
         return None, "XML 응답을 해석할 수 없음"
 
-    # 공식 응답 코드 확인
+    # 공식 응답 코드
     result_code = (
         root.findtext(".//RESULT/RESULT.CODE")
-        or root.findtext(".//RESULT/CODE")
         or root.findtext(".//RESULT.CODE")
+        or root.findtext(".//RESULT/CODE")
     )
 
     if result_code and result_code != "INFO-000":
@@ -196,9 +218,8 @@ def parse_population_xml(xml_text):
     citydata = root.find(".//CITYDATA")
 
     if citydata is None:
-        return None, "CITYDATA 항목이 없음"
+        return None, "CITYDATA 항목 없음"
 
-    # 공식 XML은 LIVE_PPLTN_STTS가 중첩된 구조
     population = citydata.find(
         "./LIVE_PPLTN_STTS/LIVE_PPLTN_STTS"
     )
@@ -207,24 +228,16 @@ def parse_population_xml(xml_text):
         population = citydata.find("./LIVE_PPLTN_STTS")
 
     if population is None:
-        return None, "실시간 인구 정보가 없음"
+        return None, "실시간 인구 정보 없음"
 
     def field(name):
-        text = population.findtext(name)
-        return text.strip() if text else None
+        value = population.findtext(name)
+        return value.strip() if value else None
 
     congestion = field("AREA_CONGEST_LVL")
     population_min = to_number(field("AREA_PPLTN_MIN"))
     population_max = to_number(field("AREA_PPLTN_MAX"))
-    non_resident = to_number(field("NON_RESNT_PPLTN_RATE"))
 
-    # API 기준 시각만 사용하고 조회 시각으로 대체하지 않음
-    population_time = field("PPLTN_TIME")
-
-    if not population_time:
-        population_time = "확인할 수 없음"
-
-    # 인구 정보가 전혀 없으면 실패로 처리
     if (
         congestion is None
         and population_min is None
@@ -232,22 +245,30 @@ def parse_population_xml(xml_text):
     ):
         return None, "혼잡도와 인구 정보가 없음"
 
-    return {
+    result = {
         "혼잡도": congestion or "확인할 수 없음",
         "인구최소": population_min,
         "인구최대": population_max,
-        "비상주비율": non_resident,
-        "인구기준시각": population_time,
-    }, None
+        "비상주비율": to_number(
+            field("NON_RESNT_PPLTN_RATE")
+        ),
+        "인구기준시각": (
+            field("PPLTN_TIME") or "확인할 수 없음"
+        ),
+    }
+
+    # 연령대별 인구 비율
+    for label, api_field in AGE_FIELDS.items():
+        result[label] = to_number(field(api_field))
+
+    return result, None
 
 
 # ----------------------------------------
-# 6. 장소 한 곳의 API 데이터 요청
+# 6. 장소 한 곳 조회
 # ----------------------------------------
 def fetch_one_area(session, area_code, key):
-    # 공식 요청 구조:
-    # /KEY/xml/citydata/1/5/AREA_NM
-    # AREA_NM에는 장소 코드도 입력 가능
+    # 공식 API 요청 주소
     url = (
         f"{API_BASE}/{key}/xml/citydata/1/5/"
         f"{area_code}"
@@ -262,33 +283,27 @@ def fetch_one_area(session, area_code, key):
 
         if response.status_code != 200:
             return None, (
-                f"서버 응답 오류(HTTP {response.status_code})"
+                f"서버 오류(HTTP {response.status_code})"
             )
 
         return parse_population_xml(response.content)
 
     except requests.exceptions.Timeout:
         return None, "10초 안에 응답하지 않음"
-
     except requests.exceptions.ConnectionError:
-        return None, "서버에 연결할 수 없음"
-
+        return None, "서버 연결 실패"
     except requests.exceptions.RequestException:
-        # URL에 인증키가 포함될 수 있어
-        # 예외 원문은 출력하지 않음
-        return None, "API 요청 중 네트워크 오류"
+        # URL에 인증키가 있으므로 예외 원문은 출력하지 않음
+        return None, "네트워크 요청 오류"
 
 
 # ----------------------------------------
-# 7. 121곳 순차 조회 및 5분 캐시
+# 7. 121곳 조회 및 5분 캐시
 # ----------------------------------------
 @st.cache_data(ttl=CACHE_SECONDS, show_spinner=False)
-def fetch_all_areas(area_records, key_fingerprint, _api_key):
+def fetch_all_areas(area_records, fingerprint, _api_key):
     results = []
     failures = []
-
-    # 실제 데이터 수집 시작 시각
-    started_at = datetime.now(KST)
 
     with requests.Session() as session:
         for index, area in enumerate(area_records):
@@ -314,13 +329,11 @@ def fetch_all_areas(area_records, key_fingerprint, _api_key):
                     **data,
                 })
 
-            # 마지막 요청 뒤에는 기다리지 않음
             if index < len(area_records) - 1:
                 time.sleep(REQUEST_INTERVAL)
 
     loaded_at = datetime.now(KST)
-
-    return results, failures, started_at, loaded_at
+    return results, failures, loaded_at
 
 
 area_records = tuple(
@@ -334,11 +347,8 @@ area_records = tuple(
     for _, row in areas.iterrows()
 )
 
-with st.spinner(
-    f"서울 {len(areas)}곳의 실시간 인구 정보를 조회하고 있습니다. "
-    "최초 조회 시 시간이 걸릴 수 있습니다."
-):
-    results, failures, started_at, loaded_at = fetch_all_areas(
+with st.spinner("서울 121곳의 인구 데이터를 조회하고 있습니다..."):
+    results, failures, loaded_at = fetch_all_areas(
         area_records,
         key_fingerprint,
         api_key,
@@ -346,36 +356,34 @@ with st.spinner(
 
 
 # ----------------------------------------
-# 8. 조회 결과 요약
+# 8. 조회 결과
 # ----------------------------------------
-st.subheader("실시간 조회 현황")
+st.subheader("실시간 데이터 조회 현황")
+
+loaded_label = loaded_at.strftime("%Y-%m-%d %H:%M:%S")
 
 st.write(
-    "**데이터 불러온 시각:** "
-    f"{loaded_at.strftime('%Y-%m-%d %H:%M:%S')} "
-    "(한국 시간)"
+    f"**데이터 불러온 시각: {loaded_label} (한국 시간)**"
 )
+
+a, b, c = st.columns(3)
+
+a.metric("조회 대상", len(areas))
+b.metric("조회 성공", len(results))
+c.metric("조회 실패", len(failures))
 
 st.caption(
-    "API 응답은 5분 동안 캐시합니다. "
-    "분류 체크박스를 변경해도 다시 조회하지 않습니다. "
-    "각 장소의 인구 기준 시각은 지도에서 별도로 확인할 수 있습니다."
+    "한 번 조회한 결과는 5분간 캐시합니다. "
+    "체크박스를 변경해도 API를 다시 호출하지 않습니다."
 )
-
-col1, col2, col3 = st.columns(3)
-
-col1.metric("조회 대상", len(areas))
-col2.metric("조회 성공", len(results))
-col3.metric("조회 실패", len(failures))
 
 if failures:
     st.warning(
         f"{len(failures)}곳의 정보를 불러오지 못했습니다. "
-        "실패한 장소는 인구 0명으로 처리하지 않고 "
-        "지도에서도 제외했습니다."
+        "실패한 장소는 인구 0명으로 처리하지 않습니다."
     )
 
-    with st.expander("조회 실패 장소 확인"):
+    with st.expander("조회 실패 장소"):
         st.dataframe(
             pd.DataFrame(failures),
             hide_index=True,
@@ -384,58 +392,61 @@ if failures:
 
 if not results:
     st.error(
-        "표시할 실시간 인구 정보가 없습니다. "
-        "인증키, API 사용 권한, 서버 상태를 확인하세요."
+        "분석할 인구 데이터가 없습니다. "
+        "API 인증키와 서버 상태를 확인하세요."
     )
     st.stop()
 
 
 # ----------------------------------------
-# 9. 지도 데이터 준비
+# 9. 비율 및 지도용 데이터 준비
 # ----------------------------------------
 df = pd.DataFrame(results)
 
-df["인구최소"] = pd.to_numeric(
-    df["인구최소"], errors="coerce"
-)
-df["인구최대"] = pd.to_numeric(
-    df["인구최대"], errors="coerce"
-)
-df["비상주비율"] = pd.to_numeric(
-    df["비상주비율"], errors="coerce"
-)
+age_labels = list(AGE_FIELDS.keys())
 
-# 혼잡도에 따라 초록색부터 빨간색 사용
-df["color"] = df["혼잡도"].apply(
-    lambda level: COLORS.get(level, UNKNOWN_COLOR)
-)
+# 연령대 비율을 숫자로 변환
+for column in age_labels:
+    df[column] = pd.to_numeric(
+        df[column], errors="coerce"
+    )
 
-# 인구 최댓값에 비례해 원의 면적을 조절
-# 지도에서 보기 좋도록 반지름에는 제곱근 비율 적용
-valid_population = df["인구최대"].dropna()
-
-max_population = (
-    valid_population.max()
-    if not valid_population.empty
-    else None
+# 청년 비율: 20대 + 30대
+# 둘 중 하나라도 없으면 결측값으로 유지
+df["청년비율"] = (
+    df["20대"] + df["30대"]
 )
 
+# 60대 이상 비율: 60대 + 70대 이상
+df["60대이상비율"] = (
+    df["60대"] + df["70대 이상"]
+)
 
-def get_radius(value):
-    if pd.isna(value) or max_population is None:
-        return 80
+youth_failures = int(df["청년비율"].isna().sum())
+senior_failures = int(df["60대이상비율"].isna().sum())
 
-    if max_population <= 0:
-        return 80
+st.subheader("연령대별 비율 확인")
 
-    proportion = max(0, value) / max_population
+a, b = st.columns(2)
 
-    return 80 + 520 * (proportion ** 0.5)
+a.metric(
+    "청년 비율 계산 실패",
+    f"{youth_failures}곳",
+)
 
+b.metric(
+    "60대 이상 비율 계산 실패",
+    f"{senior_failures}곳",
+)
 
-df["radius"] = df["인구최대"].apply(get_radius)
+st.caption(
+    "청년 비율은 20대와 30대 비율의 합입니다. "
+    "60대 이상 비율은 60대와 70대 이상 비율의 합입니다. "
+    "필요한 값이 없거나 숫자로 변환되지 않으면 "
+    "0으로 바꾸지 않고 분석에서 제외합니다."
+)
 
-# 지도 툴팁용 문자열
+# 인구 범위
 df["인구범위표시"] = df.apply(
     lambda row: (
         f"{format_population(row['인구최소'])}"
@@ -449,27 +460,77 @@ df["비상주비율표시"] = df["비상주비율"].apply(
     format_rate
 )
 
+df["청년비율표시"] = df["청년비율"].apply(
+    format_rate
+)
+
 df["인구기준시각"] = (
     df["인구기준시각"]
     .fillna("확인할 수 없음")
     .replace("", "확인할 수 없음")
 )
 
+# 점 크기: 실시간 인구 최댓값 기준
+max_population = pd.to_numeric(
+    df["인구최대"], errors="coerce"
+).max()
 
-# ----------------------------------------
-# 10. 장소 분류 체크박스
-# ----------------------------------------
-st.subheader("장소 분류 선택")
 
-st.write(
-    "표시할 분류를 선택하세요. "
-    "공원만 선택하거나 발달상권만 선택할 수도 있습니다."
+def get_radius(value):
+    if pd.isna(value) or pd.isna(max_population):
+        return 80
+
+    if max_population <= 0:
+        return 80
+
+    proportion = max(0, value) / max_population
+    return 80 + 520 * (proportion ** 0.5)
+
+
+df["radius"] = df["인구최대"].apply(get_radius)
+
+# 기존 혼잡도 지도 색상
+df["congestionColor"] = df["혼잡도"].apply(
+    lambda x: CONGESTION_COLORS.get(
+        x, UNKNOWN_COLOR
+    )
 )
 
-categories = sorted(df["분류"].dropna().unique())
+
+# ----------------------------------------
+# 10. 청년 비율 지도 색상
+# ----------------------------------------
+def youth_color(value):
+    if pd.isna(value):
+        return UNKNOWN_COLOR
+
+    # 0%는 연한 노랑, 100%는 진한 빨강
+    ratio = max(0, min(float(value) / 100, 1))
+
+    low = [254, 240, 138]
+    high = [185, 28, 28]
+
+    return [
+        int(low[i] + (high[i] - low[i]) * ratio)
+        for i in range(3)
+    ] + [220]
+
+
+df["youthColor"] = df["청년비율"].apply(
+    youth_color
+)
+
+
+# ----------------------------------------
+# 11. 장소 분류 체크박스
+# ----------------------------------------
+st.subheader("지도에 표시할 장소 분류")
+
+categories = sorted(
+    df["분류"].dropna().unique()
+)
 
 selected_categories = []
-
 columns = st.columns(3)
 
 for index, category in enumerate(categories):
@@ -488,48 +549,19 @@ filtered_df = df.loc[
 ].copy()
 
 st.write(
-    f"**현재 지도에 표시할 장소:** "
-    f"{len(filtered_df)}곳"
+    f"**현재 선택된 장소: {len(filtered_df)}곳**"
 )
 
 
 # ----------------------------------------
-# 11. 혼잡도 색상 안내
+# 12. 지도 생성 함수
 # ----------------------------------------
-st.markdown(
-    """
-    **혼잡도 색상**
-
-    🟢 여유　 🟡 보통　 🟠 약간 붐빔　 🔴 붐빔
-
-    회색은 혼잡도 등급을 확인할 수 없는 장소입니다.
-    """
-)
-
-st.caption(
-    "원의 크기는 실시간 인구 최댓값을 기준으로 "
-    "조절합니다. 인구 최댓값이 없는 장소는 "
-    "기본 크기로 표시합니다."
-)
-
-
-# ----------------------------------------
-# 12. 서울 지도 표시
-# ----------------------------------------
-st.subheader("서울 실시간 인구 지도")
-
-if filtered_df.empty:
-    st.info(
-        "선택한 분류에 해당하는 장소가 없습니다. "
-        "하나 이상의 분류를 선택해 주세요."
-    )
-
-else:
+def make_map(data, color_column, tooltip):
     layer = pdk.Layer(
         "ScatterplotLayer",
-        data=filtered_df,
+        data=data,
         get_position="[경도, 위도]",
-        get_fill_color="color",
+        get_fill_color=color_column,
         get_radius="radius",
         radius_units="meters",
         radius_min_pixels=5,
@@ -541,52 +573,299 @@ else:
         line_width_min_pixels=1,
     )
 
-    view_state = pdk.ViewState(
+    view = pdk.ViewState(
         latitude=37.5665,
         longitude=126.9780,
         zoom=10.4,
         pitch=0,
     )
 
-    tooltip = {
-        "html": (
-            "<b>{지역명}</b><br/>"
-            "분류: {분류}<br/>"
-            "혼잡도: {혼잡도}<br/>"
-            "실시간 인구: {인구범위표시}<br/>"
-            "비상주 인구 비율: {비상주비율표시}<br/>"
-            "인구 데이터 기준 시각: {인구기준시각}"
-        ),
-        "style": {
-            "backgroundColor": "#20242b",
-            "color": "white",
-            "fontSize": "13px",
-            "padding": "10px",
-        },
-    }
-
-    deck = pdk.Deck(
+    return pdk.Deck(
         layers=[layer],
-        initial_view_state=view_state,
-        tooltip=tooltip,
+        initial_view_state=view,
         map_style="light",
-    )
-
-    st.pydeck_chart(
-        deck,
-        use_container_width=True,
-        height=650,
+        tooltip={
+            "html": tooltip,
+            "style": {
+                "backgroundColor": "#20242b",
+                "color": "white",
+                "fontSize": "13px",
+                "padding": "10px",
+            },
+        },
     )
 
 
 # ----------------------------------------
-# 13. 추가 안내
+# 13. 기존 혼잡도 지도
+# ----------------------------------------
+st.subheader("서울 실시간 혼잡도 지도")
+
+st.markdown(
+    "🟢 여유　🟡 보통　🟠 약간 붐빔　🔴 붐빔"
+)
+
+congestion_tooltip = (
+    "<b>{지역명}</b><br/>"
+    "분류: {분류}<br/>"
+    "혼잡도: {혼잡도}<br/>"
+    "실시간 인구: {인구범위표시}<br/>"
+    "비상주 인구 비율: {비상주비율표시}<br/>"
+    "인구 데이터 기준 시각: {인구기준시각}"
+)
+
+if filtered_df.empty:
+    st.info("표시할 장소 분류를 선택하세요.")
+else:
+    st.pydeck_chart(
+        make_map(
+            filtered_df,
+            "congestionColor",
+            congestion_tooltip,
+        ),
+        use_container_width=True,
+        height=550,
+    )
+
+
+# ----------------------------------------
+# 14. 새 청년 비율 지도
+# ----------------------------------------
+st.subheader("서울 청년 인구 비율 지도")
+
+st.write(
+    "20대와 30대의 인구 비율을 합한 값으로 "
+    "점의 색을 표시합니다."
+)
+
+st.caption(
+    "연한 노랑은 청년 비율이 낮은 지역, "
+    "진한 빨강은 청년 비율이 높은 지역입니다. "
+    "회색은 청년 비율을 확인할 수 없는 지역입니다."
+)
+
+youth_tooltip = (
+    "<b>{지역명}</b><br/>"
+    "분류: {분류}<br/>"
+    "청년 비율: {청년비율표시}<br/>"
+    "실시간 인구: {인구범위표시}<br/>"
+    "인구 데이터 기준 시각: {인구기준시각}"
+)
+
+if filtered_df.empty:
+    st.info("표시할 장소 분류를 선택하세요.")
+else:
+    st.pydeck_chart(
+        make_map(
+            filtered_df,
+            "youthColor",
+            youth_tooltip,
+        ),
+        use_container_width=True,
+        height=550,
+    )
+
+st.caption(
+    "두 지도 모두 점의 크기는 실시간 인구 "
+    "추정 범위의 최댓값을 기준으로 합니다."
+)
+
+
+# ----------------------------------------
+# 15. 연령대별 상위 6곳 선정
+# ----------------------------------------
+st.divider()
+st.header("📊 연령대별 인구 비율 비교")
+
+# 순위를 계산할 때는 연령대별 모든 값이 있어야
+# 누적 막대그래프의 구성이 완전해짐
+complete_age_df = df.dropna(
+    subset=age_labels
+).copy()
+
+youth_top6 = (
+    complete_age_df
+    .sort_values(
+        ["청년비율", "코드"],
+        ascending=[False, True],
+    )
+    .head(6)
+    .copy()
+)
+
+senior_top6 = (
+    complete_age_df
+    .sort_values(
+        ["60대이상비율", "코드"],
+        ascending=[False, True],
+    )
+    .head(6)
+    .copy()
+)
+
+st.caption(
+    "상위 6곳은 조회에 성공하고 모든 연령대별 "
+    "비율을 확인할 수 있는 장소에서 선정합니다. "
+    "지도에서 선택한 분류와 관계없이 "
+    "전체 조회 장소를 기준으로 계산합니다."
+)
+
+st.write(
+    f"**연령대별 비율이 모두 유효한 장소:** "
+    f"{len(complete_age_df)}곳"
+)
+
+
+# ----------------------------------------
+# 16. 연령대별 누적 막대그래프 함수
+# ----------------------------------------
+def make_age_chart(top_df, title):
+    if top_df.empty:
+        return None
+
+    chart_df = top_df.copy()
+
+    # 이름이 중복되더라도 장소 코드를 통해 구분
+    chart_df["장소표시"] = (
+        chart_df["지역명"]
+        + " ("
+        + chart_df["코드"]
+        + ")"
+    )
+
+    # 상위 장소부터 순서대로 표시
+    place_order = chart_df["장소표시"].tolist()
+
+    fig = go.Figure()
+
+    for index, age in enumerate(age_labels):
+        fig.add_trace(
+            go.Bar(
+                name=age,
+                y=chart_df["장소표시"],
+                x=chart_df[age],
+                orientation="h",
+                marker_color=AGE_COLORS[index],
+                customdata=[
+                    [
+                        row["지역명"],
+                        age,
+                        row[age],
+                    ]
+                    for _, row in chart_df.iterrows()
+                ],
+                hovertemplate=(
+                    "지역명: %{customdata[0]}<br>"
+                    "연령대: %{customdata[1]}<br>"
+                    "인구 비율: %{customdata[2]:.1f}%"
+                    "<extra></extra>"
+                ),
+            )
+        )
+
+    fig.update_layout(
+        title=title,
+        barmode="stack",
+        height=480,
+        xaxis_title="연령대별 인구 비율(%)",
+        yaxis_title="",
+        xaxis=dict(range=[0, 105]),
+        yaxis=dict(
+            categoryorder="array",
+            categoryarray=list(reversed(place_order)),
+        ),
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.18,
+            xanchor="left",
+            x=0,
+        ),
+        margin=dict(
+            l=20,
+            r=20,
+            t=85,
+            b=95,
+        ),
+    )
+
+    return fig
+
+
+# ----------------------------------------
+# 17. 두 그래프 나란히 표시
+# ----------------------------------------
+col1, col2 = st.columns(2)
+
+with col1:
+    st.subheader("청년 비율 상위 6곳")
+
+    if youth_top6.empty:
+        st.info("청년 비율을 비교할 데이터가 없습니다.")
+    else:
+        youth_fig = make_age_chart(
+            youth_top6,
+            f"청년 비율 TOP 6<br>"
+            f"<sup>조회: {loaded_label} (KST)</sup>",
+        )
+
+        st.plotly_chart(
+            youth_fig,
+            use_container_width=True,
+        )
+
+        st.dataframe(
+            youth_top6[
+                ["지역명", "청년비율"]
+            ].rename(
+                columns={"청년비율": "청년 비율(%)"}
+            ),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+with col2:
+    st.subheader("60대 이상 비율 상위 6곳")
+
+    if senior_top6.empty:
+        st.info("60대 이상 비율을 비교할 데이터가 없습니다.")
+    else:
+        senior_fig = make_age_chart(
+            senior_top6,
+            f"60대 이상 비율 TOP 6<br>"
+            f"<sup>조회: {loaded_label} (KST)</sup>",
+        )
+
+        st.plotly_chart(
+            senior_fig,
+            use_container_width=True,
+        )
+
+        st.dataframe(
+            senior_top6[
+                ["지역명", "60대이상비율"]
+            ].rename(
+                columns={
+                    "60대이상비율": "60대 이상 비율(%)"
+                }
+            ),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+
+# ----------------------------------------
+# 18. 분석 결과 안내
 # ----------------------------------------
 st.info(
-    "실시간 인구는 정확한 인원수가 아니라 "
-    "서울시가 추정한 인구 범위입니다. "
-    "각 장소의 인구 데이터 기준 시각이 서로 다를 수 있으므로 "
-    "지도에서 확인해 주세요."
+    "연령대별 인구 비율은 서울시가 추정한 "
+    "실시간 인구 구성 비율입니다. "
+    "해당 장소에 거주하는 주민의 연령 구성과는 "
+    "다를 수 있습니다."
+)
+
+st.caption(
+    f"데이터 불러온 시각: {loaded_label} (한국 시간)"
 )
 
 st.caption(
